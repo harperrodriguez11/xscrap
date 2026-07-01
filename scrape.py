@@ -164,29 +164,45 @@ async def run():
             await browser.close()
             sys.exit(2)
 
-        last_height = 0
         stuck_ticks = 0
         total_found = 0
+        tick = 0
+        start_time = time.time()
 
         while total_found < MAX_URLS:
+            tick += 1
             nv, ni = await scan_page(page, seen_videos, seen_images)
             total_found = len(seen_videos) + len(seen_images)
+            elapsed = time.time() - start_time
+
+            # Stall is judged on ACTUAL new URLs found, not DOM height —
+            # X can keep growing scrollHeight (placeholders, ads, unrelated
+            # content) while producing zero matching video/image tweets.
             if nv or ni:
                 stuck_ticks = 0
-                print(f"[+] +{len(nv)} video, +{len(ni)} image  (total {total_found}/{MAX_URLS})")
+            else:
+                stuck_ticks += 1
+
+            # Print on every single tick so it's obvious the loop is alive,
+            # even when a scroll finds nothing new.
+            print(
+                f"[tick {tick:>3}] +{len(nv)}v +{len(ni)}i this scroll  "
+                f"| total {total_found}/{MAX_URLS}  "
+                f"| idle {stuck_ticks}/{MAX_STUCK}  "
+                f"| {elapsed:0.0f}s elapsed",
+                flush=True,
+            )
 
             if total_found >= MAX_URLS:
+                print(f"[✓] Target of {MAX_URLS} reached.")
                 break
 
-            height = await page.evaluate("document.documentElement.scrollHeight")
-            if height == last_height:
-                stuck_ticks += 1
-            else:
-                stuck_ticks = 0
-                last_height = height
-
             if stuck_ticks >= MAX_STUCK:
-                print("[!] Page appears exhausted (no new content) — stopping.")
+                print(
+                    f"[!] {MAX_STUCK} scrolls in a row with no new video/image URLs — "
+                    f"feed exhausted (or you've hit everything available). "
+                    f"Stopping and saving what was found."
+                )
                 break
 
             viewport = page.viewport_size or {"height": 900}
