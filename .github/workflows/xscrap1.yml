@@ -1,0 +1,46 @@
+name: X URL Scraper
+on:
+  workflow_dispatch:
+    inputs:
+      usernames:
+        description: "Comma/space/newline-separated X usernames to scrape (no @). Leave blank to use target_url instead."
+        required: false
+        default: ""
+      target_url:
+        description: "Fallback page to scrape if usernames is blank (home timeline, a search, etc.)"
+        required: false
+        default: "https://x.com/home"
+      max_urls:
+        description: "Max URLs to collect PER target (per username, or for the single target_url)"
+        required: false
+        default: "50"
+      concurrency:
+        description: "How many usernames to scrape at the same time"
+        required: false
+        default: "3"
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+      - name: Run scraper
+        env:
+          X_AUTH_TOKEN:   ${{ secrets.X_AUTH_TOKEN }}
+          X_CT0:          ${{ secrets.X_CT0 }}
+          X_TWID:         ${{ secrets.X_TWID }}
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
+          X_USERNAMES:    ${{ github.event.inputs.usernames }}
+          X_TARGET_URL:   ${{ github.event.inputs.target_url }}
+          X_MAX_URLS:     ${{ github.event.inputs.max_urls }}
+          X_CONCURRENCY:  ${{ github.event.inputs.concurrency }}
+        run: python xscrap1.py
