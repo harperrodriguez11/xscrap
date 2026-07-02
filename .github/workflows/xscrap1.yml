@@ -44,3 +44,12 @@ jobs:
           X_MAX_URLS:     ${{ github.event.inputs.max_urls }}
           X_CONCURRENCY:  ${{ github.event.inputs.concurrency }}
         run: python xscrap1.py
+  # Add this step right after "Run scraper" in your existing workflow.
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: debug_artifacts/
+          if-no-files-found: ignore
+          retention-days: 3
