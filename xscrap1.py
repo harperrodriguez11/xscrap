@@ -36,13 +36,13 @@ CONCURRENCY  = int(os.environ.get("X_CONCURRENCY", "3"))
 MAX_URLS     = int(os.environ.get("X_MAX_URLS", "50"))          # per target
 MAX_STUCK    = int(os.environ.get("X_MAX_STUCK_TICKS", "8"))
 HEADLESS     = os.environ.get("X_HEADLESS", "true").lower() != "false"
+DEBUG_DIR    = os.environ.get("X_DEBUG_DIR", "debug_artifacts")
 
 AUTH_TOKEN = os.environ.get("X_AUTH_TOKEN")
 CT0        = os.environ.get("X_CT0")
 TWID       = os.environ.get("X_TWID")
 
 # Same sheet the download workflow reads from — "Videos" / "Images" tabs.
-# https://docs.google.com/spreadsheets/d/17PZy32Hmr504A7gVkGoH0OMJSQPd1oZVtaVp6Cyu74Y/edit
 URLS_SHEET_ID = os.environ.get("X_URLS_SHEET_ID", "17PZy32Hmr504A7gVkGoH0OMJSQPd1oZVtaVp6Cyu74Y")
 URLS_SHEET_TABS = {"video": "Videos", "image": "Images"}
 URL_HEADER = ["Tweet URL"]
@@ -52,6 +52,8 @@ if not AUTH_TOKEN or not CT0:
     sys.exit(1)
 
 STATUS_RE = re.compile(r"(https://x\.com/[^/?#]+/status/\d+)")
+
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 def clean_url(href):
@@ -64,9 +66,6 @@ def clean_url(href):
 
 
 def build_targets():
-    """Returns the list of page URLs to scrape. If usernames were given,
-    each becomes its own profile-page target; otherwise falls back to the
-    single TARGET_URL (home timeline, a search, etc.)."""
     if USERNAMES:
         raw = re.split(r'[,\n\s]+', USERNAMES)
         names = [n.strip().lstrip('@') for n in raw if n.strip()]
@@ -106,7 +105,6 @@ def human_step(viewport_height: int) -> int:
 
 
 async def classify_article(article):
-    """Return dict(url, is_video, is_image) or None."""
     href = None
     time_link = await article.query_selector('a[href*="/status/"] time')
     if time_link:
@@ -162,10 +160,45 @@ async def scan_page(page, seen_videos: set, seen_images: set):
     return new_videos, new_images
 
 
+async def dump_debug(page, tag_safe, reason):
+    """Save a screenshot + HTML snapshot so failures are diagnosable from
+    the GitHub Actions artifact instead of guessing blind."""
+    try:
+        png_path = os.path.join(DEBUG_DIR, f"{tag_safe}_{reason}.png")
+        html_path = os.path.join(DEBUG_DIR, f"{tag_safe}_{reason}.html")
+        await page.screenshot(path=png_path, full_page=True)
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"[debug] saved {png_path} and {html_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[debug] failed to capture debug artifacts: {e}", file=sys.stderr)
+
+
+async def is_logged_out(page) -> bool:
+    """X frequently does NOT redirect to /login on an expired/invalid
+    session — it just renders a logged-out shell on the same URL. Check
+    for that explicitly instead of relying only on page.url."""
+    if "login" in page.url or "flow/login" in page.url:
+        return True
+    try:
+        # Logged-out home shows a "Sign in to X" / "Sign up" prompt.
+        signin = await page.query_selector('a[href="/login"]')
+        if signin:
+            return True
+        # Primary column / sidebar only exist for authenticated sessions.
+        primary_col = await page.query_selector('[data-testid="primaryColumn"]')
+        if not primary_col:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def scrape_one_target(browser, label, target_url, seen_videos, seen_images, merge_lock):
-    """Scrapes a single page (profile/home/search) in its own context, then
-    merges any URLs it found into the shared, deduped result sets."""
     local_videos, local_images = set(), set()
+    tag = f"[{label or target_url}]"
+    tag_safe = re.sub(r"[^a-zA-Z0-9_-]", "_", label or "target")
 
     context = await browser.new_context(
         viewport={"width": 1280, "height": 900},
@@ -173,24 +206,56 @@ async def scrape_one_target(browser, label, target_url, seen_videos, seen_images
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         ),
+        locale="en-US",
     )
-    cookies = [
-        {"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com", "path": "/", "httpOnly": True, "secure": True},
-        {"name": "ct0", "value": CT0, "domain": ".x.com", "path": "/", "httpOnly": False, "secure": True},
-    ]
-    if TWID:
-        cookies.append({"name": "twid", "value": TWID, "domain": ".x.com", "path": "/", "secure": True})
+
+    # Set cookies on BOTH x.com and twitter.com — many exported session
+    # cookies are still scoped to twitter.com under the hood, and setting
+    # them on only one domain is a common reason auth silently fails.
+    cookie_domains = [".x.com", ".twitter.com"]
+    cookies = []
+    for domain in cookie_domains:
+        cookies.append({
+            "name": "auth_token", "value": AUTH_TOKEN, "domain": domain,
+            "path": "/", "httpOnly": True, "secure": True, "sameSite": "None",
+        })
+        cookies.append({
+            "name": "ct0", "value": CT0, "domain": domain,
+            "path": "/", "httpOnly": False, "secure": True, "sameSite": "None",
+        })
+        if TWID:
+            cookies.append({
+                "name": "twid", "value": TWID, "domain": domain,
+                "path": "/", "secure": True, "sameSite": "None",
+            })
     await context.add_cookies(cookies)
 
-    tag = f"[{label or target_url}]"
     try:
         page = await context.new_page()
-        await page.goto(target_url, wait_until="domcontentloaded")
-        await asyncio.sleep(random.uniform(2.0, 3.5))
+        # Also set the x-csrf-token header to match ct0 — some XHR calls
+        # the timeline depends on will 403 without it lining up.
+        await page.set_extra_http_headers({"x-csrf-token": CT0})
 
-        if "login" in page.url or "flow/login" in page.url:
-            print(f"{tag} ERROR: not authenticated — cookies rejected or expired.", file=sys.stderr)
+        await page.goto(target_url, wait_until="networkidle", timeout=45000)
+
+        if await is_logged_out(page):
+            print(f"{tag} ERROR: not authenticated — cookies rejected, expired, or scoped to the wrong domain.", file=sys.stderr)
+            await dump_debug(page, tag_safe, "logged_out")
             return
+
+        # Wait explicitly for at least one tweet to render instead of a
+        # flat sleep — SPA hydration + the timeline XHR can take longer
+        # than a fixed delay, especially on a cold CI runner.
+        try:
+            await page.wait_for_selector('article[data-testid="tweet"]', timeout=20000)
+        except Exception:
+            print(f"{tag} WARNING: no tweet articles appeared within 20s — page may be rate-limited, "
+                  f"showing a challenge, or the account has no visible posts.", file=sys.stderr)
+            await dump_debug(page, tag_safe, "no_tweets_found")
+            # Don't return immediately — fall through and let the scan loop
+            # try anyway in case tweets arrive a beat later.
+
+        await asyncio.sleep(random.uniform(1.0, 2.0))
 
         stuck_ticks = 0
         total_found = 0
@@ -216,6 +281,11 @@ async def scrape_one_target(browser, label, target_url, seen_videos, seen_images
                 flush=True,
             )
 
+            if tick == 1 and total_found == 0:
+                # First scan found literally nothing — capture evidence now,
+                # before we scroll away from whatever state caused it.
+                await dump_debug(page, tag_safe, "first_scan_empty")
+
             if total_found >= MAX_URLS:
                 print(f"{tag} [✓] Target of {MAX_URLS} reached.")
                 break
@@ -229,6 +299,12 @@ async def scrape_one_target(browser, label, target_url, seen_videos, seen_images
             await page.mouse.wheel(0, step)
             await asyncio.sleep(human_delay())
 
+    except Exception as e:
+        print(f"{tag} ERROR during scrape: {e!r}", file=sys.stderr)
+        try:
+            await dump_debug(page, tag_safe, "exception")
+        except Exception:
+            pass
     finally:
         await context.close()
 
@@ -301,8 +377,6 @@ def ensure_tab_exists(sheets_service, spreadsheet_id, tab_name, header):
     ).execute()
 
 def replace_url_list(sheets_service, spreadsheet_id, tab_name, urls):
-    """Wipes everything below the header row, then writes the fresh list —
-    this run's results fully replace whatever was there before."""
     sheets_service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A2:A"
     ).execute()
@@ -341,7 +415,8 @@ def main():
                     f"- Targets: {label_desc}\n"
                     f"- Videos found: {len(seen_videos)}\n"
                     f"- Images found: {len(seen_images)}\n"
-                    f"- Written to sheet: {URLS_SHEET_ID}\n")
+                    f"- Written to sheet: {URLS_SHEET_ID}\n"
+                    f"- Debug artifacts (if any failures occurred): `{DEBUG_DIR}/`\n")
 
 
 if __name__ == "__main__":
