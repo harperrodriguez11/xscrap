@@ -8,7 +8,7 @@ on:
         default: "https://x.com/home"
       max_urls:
         description: "Max total URLs to collect"
-        required: false
+        required: falselist.
         default: "50"
 jobs:
   scrape:
@@ -33,4 +33,4 @@ jobs:
           GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
           X_TARGET_URL:      ${{ github.event.inputs.target_url }}
           X_MAX_URLS:        ${{ github.event.inputs.max_urls }}
-        run: python scrape.py
+        run: python scrape1.py
