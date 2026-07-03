@@ -40,7 +40,7 @@ MAX_URLS_PER_TARGET = int(os.environ.get("X_MAX_URLS", "50"))
 MAX_STUCK           = int(os.environ.get("X_MAX_STUCK_TICKS", "8"))
 HEADLESS            = os.environ.get("X_HEADLESS", "true").lower() != "false"
 
-BETWEEN_TARGET_DELAY = (1.5, 3.0)  # seconds, human-ish pause when switching accounts
+BETWEEN_TARGET_DELAY = (3.0, 6.0)  # seconds, human-ish pause when switching accounts
 
 AUTH_TOKEN = os.environ.get("X_AUTH_TOKEN")
 CT0        = os.environ.get("X_CT0")
@@ -92,25 +92,27 @@ def resolve_targets() -> list[tuple[str, str]]:
 
 def human_delay() -> float:
     r = random.random()
-    if r < 0.05:
-        return random.uniform(1.0, 1.8)   # occasional longer pause (was 2.4-4.0)
-    if r < 0.15:
-        return random.uniform(0.4, 0.7)   # was 0.9-1.5
+    if r < 0.08:
+        return random.uniform(2.4, 4.0)
+    if r < 0.20:
+        return random.uniform(0.9, 1.5)
     if r < 0.55:
-        return random.uniform(0.15, 0.28) # was 0.42-0.70
+        return random.uniform(0.42, 0.70)
     if r < 0.82:
-        return random.uniform(0.10, 0.20) # was 0.30-0.50
-    return random.uniform(0.08, 0.15)     # was 0.30-0.45
+        return random.uniform(0.30, 0.50)
+    return random.uniform(0.30, 0.45)
+
 
 def human_step(viewport_height: int) -> int:
     r = random.random()
-    if r < 0.10:
-        return int(viewport_height * random.uniform(0.5, 0.8))   # was 0.15-0.35
-    if r < 0.45:
-        return int(viewport_height * random.uniform(0.9, 1.3))   # was 0.40-0.70
-    if r < 0.80:
-        return int(viewport_height * random.uniform(1.3, 1.8))   # was 0.65-0.95
-    return int(viewport_height * random.uniform(1.8, 2.4))       # was 1.0-1.4
+    if r < 0.12:
+        return int(viewport_height * random.uniform(0.15, 0.35))
+    if r < 0.50:
+        return int(viewport_height * random.uniform(0.40, 0.70))
+    if r < 0.82:
+        return int(viewport_height * random.uniform(0.65, 0.95))
+    return int(viewport_height * random.uniform(1.0, 1.4))
+
 
 async def classify_article(article):
     """Return dict(url, is_video, is_image) or None."""
@@ -173,7 +175,7 @@ async def scrape_one_target(page, label, url, seen_videos, seen_images, video_so
     """Open a single target, scroll until MAX_URLS_PER_TARGET or stuck, then return."""
     print(f"\n=== Target: {label} ({url}) ===", flush=True)
     await page.goto(url, wait_until="domcontentloaded")
-    await asyncio.sleep(random.uniform(1.0, 1.8))
+    await asyncio.sleep(random.uniform(2.0, 3.5))
 
     if "login" in page.url or "flow/login" in page.url:
         print(f"  [!] Not authenticated when loading {label} — cookies rejected or expired. "
