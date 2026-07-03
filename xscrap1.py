@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-X.com video/image URL scraper using Playwright.
+X.com video/image URL scraper using Playwright — multi-username version.
 
 Auth is done via session cookies (auth_token, ct0, twid) passed through
 environment variables that map to GitHub Actions encrypted secrets.
 NEVER commit cookies to the repo or hardcode them in this file.
 
+You can pass either:
+  - X_TARGET_USERNAMES: a comma- and/or newline-separated list of usernames
+    (with or without "@") or full URLs (profile, search, home, etc). Targets
+    are scraped ONE AT A TIME, in the order given — open target 1, scroll
+    and collect until done/stuck, move to target 2, etc.
+  - X_TARGET_URL: single-target fallback (old behavior), used only if
+    X_TARGET_USERNAMES is not set.
+
 Output: results are written straight into a Google Sheet —
     - all video tweet URLs -> "Videos" tab
     - all image tweet URLs -> "Images" tab
-Each run REPLACES the previous list in those tabs with the freshly
-scraped one.
+Each tab now has two columns: Tweet URL, Source (the username/URL it came
+from). Each run REPLACES the previous contents of those tabs.
 """
 
 import asyncio
@@ -25,10 +33,14 @@ from playwright.async_api import async_playwright
 
 # ── Config (override via env vars / workflow inputs) ────────────────────────
 
-TARGET_URL   = os.environ.get("X_TARGET_URL", "https://x.com/home")
-MAX_URLS     = int(os.environ.get("X_MAX_URLS", "50"))
-MAX_STUCK    = int(os.environ.get("X_MAX_STUCK_TICKS", "8"))
-HEADLESS     = os.environ.get("X_HEADLESS", "true").lower() != "false"
+TARGET_USERNAMES_RAW = os.environ.get("X_TARGET_USERNAMES", "").strip()
+TARGET_URL_FALLBACK  = os.environ.get("X_TARGET_URL", "https://x.com/home")
+
+MAX_URLS_PER_TARGET = int(os.environ.get("X_MAX_URLS", "50"))
+MAX_STUCK           = int(os.environ.get("X_MAX_STUCK_TICKS", "8"))
+HEADLESS            = os.environ.get("X_HEADLESS", "true").lower() != "false"
+
+BETWEEN_TARGET_DELAY = (3.0, 6.0)  # seconds, human-ish pause when switching accounts
 
 AUTH_TOKEN = os.environ.get("X_AUTH_TOKEN")
 CT0        = os.environ.get("X_CT0")
@@ -37,7 +49,7 @@ TWID       = os.environ.get("X_TWID")
 # Sheet to write results into — "Videos" / "Images" tabs.
 URLS_SHEET_ID = os.environ.get("X_URLS_SHEET_ID", "17PZy32Hmr504A7gVkGoH0OMJSQPd1oZVtaVp6Cyu74Y")
 URLS_SHEET_TABS = {"video": "Videos", "image": "Images"}
-URL_HEADER = ["Tweet URL"]
+URL_HEADER = ["Tweet URL", "Source"]
 
 if not AUTH_TOKEN or not CT0:
     print("ERROR: X_AUTH_TOKEN and X_CT0 must be set as secrets/env vars.", file=sys.stderr)
@@ -53,6 +65,29 @@ def clean_url(href: str | None) -> str | None:
         href = "https://x.com" + href
     m = STATUS_RE.match(href) or STATUS_RE.search(href)
     return m.group(1) if m else None
+
+
+def resolve_targets() -> list[tuple[str, str]]:
+    """Return list of (label, url) pairs to scrape, in order."""
+    if not TARGET_USERNAMES_RAW:
+        return [(TARGET_URL_FALLBACK, TARGET_URL_FALLBACK)]
+
+    # split on commas and/or newlines
+    raw_items = re.split(r"[,\n]+", TARGET_USERNAMES_RAW)
+    targets = []
+    for item in raw_items:
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith("http://") or item.startswith("https://"):
+            url = item
+            label = item
+        else:
+            username = item.lstrip("@")
+            url = f"https://x.com/{username}"
+            label = username
+        targets.append((label, url))
+    return targets
 
 
 def human_delay() -> float:
@@ -136,9 +171,73 @@ async def scan_page(page, seen_videos: set, seen_images: set):
     return new_videos, new_images
 
 
+async def scrape_one_target(page, label, url, seen_videos, seen_images, video_source, image_source):
+    """Open a single target, scroll until MAX_URLS_PER_TARGET or stuck, then return."""
+    print(f"\n=== Target: {label} ({url}) ===", flush=True)
+    await page.goto(url, wait_until="domcontentloaded")
+    await asyncio.sleep(random.uniform(2.0, 3.5))
+
+    if "login" in page.url or "flow/login" in page.url:
+        print(f"  [!] Not authenticated when loading {label} — cookies rejected or expired. "
+              f"Skipping this target.", file=sys.stderr)
+        return 0, 0
+
+    found_this_target = 0
+    stuck_ticks = 0
+    tick = 0
+    start_time = time.time()
+
+    while found_this_target < MAX_URLS_PER_TARGET:
+        tick += 1
+        before_v, before_i = len(seen_videos), len(seen_images)
+        nv, ni = await scan_page(page, seen_videos, seen_images)
+
+        # tag newly-discovered URLs with which target they came from
+        for u in nv:
+            video_source.setdefault(u, label)
+        for u in ni:
+            image_source.setdefault(u, label)
+
+        found_this_target += (len(seen_videos) - before_v) + (len(seen_images) - before_i)
+        elapsed = time.time() - start_time
+
+        if nv or ni:
+            stuck_ticks = 0
+        else:
+            stuck_ticks += 1
+
+        print(
+            f"  [{label} | tick {tick:>3}] +{len(nv)}v +{len(ni)}i this scroll  "
+            f"| target total {found_this_target}/{MAX_URLS_PER_TARGET}  "
+            f"| idle {stuck_ticks}/{MAX_STUCK}  "
+            f"| {elapsed:0.0f}s elapsed",
+            flush=True,
+        )
+
+        if found_this_target >= MAX_URLS_PER_TARGET:
+            print(f"  [✓] {label}: target of {MAX_URLS_PER_TARGET} reached.")
+            break
+
+        if stuck_ticks >= MAX_STUCK:
+            print(f"  [!] {label}: {MAX_STUCK} scrolls with no new URLs — feed exhausted, moving on.")
+            break
+
+        viewport = page.viewport_size or {"height": 900}
+        step = human_step(viewport["height"])
+        await page.mouse.wheel(0, step)
+        await asyncio.sleep(human_delay())
+
+    return found_this_target, tick
+
+
 async def run():
+    targets = resolve_targets()
+    print(f"Loaded {len(targets)} target(s): {[t[0] for t in targets]}", flush=True)
+
     seen_videos: set[str] = set()
     seen_images: set[str] = set()
+    video_source: dict[str, str] = {}
+    image_source: dict[str, str] = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -162,81 +261,38 @@ async def run():
         await context.add_cookies(cookies)
 
         page = await context.new_page()
-        await page.goto(TARGET_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(random.uniform(2.0, 3.5))
 
-        # Verify we're actually logged in
-        if "login" in page.url or "flow/login" in page.url:
-            print("ERROR: not authenticated — cookies rejected or expired.", file=sys.stderr)
-            await browser.close()
-            sys.exit(2)
-
-        stuck_ticks = 0
-        total_found = 0
-        tick = 0
-        start_time = time.time()
-
-        while total_found < MAX_URLS:
-            tick += 1
-            nv, ni = await scan_page(page, seen_videos, seen_images)
-            total_found = len(seen_videos) + len(seen_images)
-            elapsed = time.time() - start_time
-
-            # Stall is judged on ACTUAL new URLs found, not DOM height —
-            # X can keep growing scrollHeight (placeholders, ads, unrelated
-            # content) while producing zero matching video/image tweets.
-            if nv or ni:
-                stuck_ticks = 0
-            else:
-                stuck_ticks += 1
-
-            # Print on every single tick so it's obvious the loop is alive,
-            # even when a scroll finds nothing new.
-            print(
-                f"[tick {tick:>3}] +{len(nv)}v +{len(ni)}i this scroll  "
-                f"| total {total_found}/{MAX_URLS}  "
-                f"| idle {stuck_ticks}/{MAX_STUCK}  "
-                f"| {elapsed:0.0f}s elapsed",
-                flush=True,
-            )
-
-            if total_found >= MAX_URLS:
-                print(f"[✓] Target of {MAX_URLS} reached.")
-                break
-
-            if stuck_ticks >= MAX_STUCK:
-                print(
-                    f"[!] {MAX_STUCK} scrolls in a row with no new video/image URLs — "
-                    f"feed exhausted (or you've hit everything available). "
-                    f"Stopping and saving what was found."
-                )
-                break
-
-            viewport = page.viewport_size or {"height": 900}
-            step = human_step(viewport["height"])
-            await page.mouse.wheel(0, step)
-            await asyncio.sleep(human_delay())
+        for i, (label, url) in enumerate(targets):
+            await scrape_one_target(page, label, url, seen_videos, seen_images, video_source, image_source)
+            if i < len(targets) - 1:
+                pause = random.uniform(*BETWEEN_TARGET_DELAY)
+                print(f"  ...pausing {pause:0.1f}s before next target...", flush=True)
+                await asyncio.sleep(pause)
 
         await browser.close()
 
-    print(f"\nDone scraping. {len(seen_videos)} video URL(s), {len(seen_images)} image URL(s) total.")
+    print(f"\nDone scraping all targets. {len(seen_videos)} video URL(s), "
+          f"{len(seen_images)} image URL(s) total.")
 
     # ── Write to Google Sheets ───────────────────────────────────────────
     sheets_service = get_sheets_service()
     ensure_tab_exists(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["video"], URL_HEADER)
     ensure_tab_exists(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["image"], URL_HEADER)
 
-    replace_url_list(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["video"], sorted(seen_videos))
-    replace_url_list(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["image"], sorted(seen_images))
+    video_rows = [[u, video_source.get(u, "")] for u in sorted(seen_videos)]
+    image_rows = [[u, image_source.get(u, "")] for u in sorted(seen_images)]
 
-    print(f"📝 Replaced 'Videos' tab with {len(seen_videos)} URL(s).")
-    print(f"📝 Replaced 'Images' tab with {len(seen_images)} URL(s).")
+    replace_url_list(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["video"], video_rows)
+    replace_url_list(sheets_service, URLS_SHEET_ID, URLS_SHEET_TABS["image"], image_rows)
+
+    print(f"📝 Replaced 'Videos' tab with {len(video_rows)} row(s).")
+    print(f"📝 Replaced 'Images' tab with {len(image_rows)} row(s).")
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a") as f:
             f.write(f"### Scrape complete\n\n"
-                    f"- Target: {TARGET_URL}\n"
+                    f"- Targets: {', '.join(t[0] for t in targets)}\n"
                     f"- Videos found: {len(seen_videos)}\n"
                     f"- Images found: {len(seen_images)}\n"
                     f"- Written to sheet: {URLS_SHEET_ID}\n")
@@ -283,13 +339,12 @@ def ensure_tab_exists(sheets_service, spreadsheet_id, tab_name, header):
     ).execute()
 
 
-def replace_url_list(sheets_service, spreadsheet_id, tab_name, urls):
+def replace_url_list(sheets_service, spreadsheet_id, tab_name, rows):
     sheets_service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A2:A"
+        spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A2:B"
     ).execute()
-    if not urls:
+    if not rows:
         return
-    rows = [[u] for u in urls]
     sheets_service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A2",
         valueInputOption="RAW", body={"values": rows}
