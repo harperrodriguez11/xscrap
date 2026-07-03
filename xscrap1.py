@@ -205,12 +205,33 @@ async def is_logged_out(page) -> bool:
         signin = await page.query_selector('a[href="/login"]')
         if signin:
             return True
+        # NOTE: don't treat "no primaryColumn" alone as logged-out. A
+        # suspended/deactivated/nonexistent username also renders without
+        # a primaryColumn (X shows a "this page doesn't exist" panel
+        # instead) even though the session is perfectly authenticated --
+        # that's a bad username, not a bad session. See is_missing_user().
         primary_col = await page.query_selector('[data-testid="primaryColumn"]')
+        if not primary_col and await is_missing_user(page):
+            return False
         if not primary_col:
             return True
     except Exception:
         pass
     return False
+
+
+async def is_missing_user(page) -> bool:
+    """Detect X's 'this account doesn't exist' / suspended-user page so we
+    can report it distinctly instead of misclassifying it as an auth
+    failure. Confirms the sidebar nav (proof we ARE logged in) is present
+    alongside the empty-state message."""
+    try:
+        body_text = await page.inner_text("body")
+    except Exception:
+        return False
+    markers = ("page doesn’t exist", "page doesn't exist", "account doesn’t exist",
+               "account doesn't exist", "account has been suspended")
+    return any(m in body_text for m in markers)
 
 
 async def goto_with_retry(page, url, attempts=2):
@@ -272,6 +293,13 @@ async def scrape_one_target(browser, label, target_url, idx, seen_videos, seen_i
         await page.set_extra_http_headers({"x-csrf-token": CT0})
 
         await goto_with_retry(page, target_url)
+
+        if await is_missing_user(page):
+            print(f"{tag} SKIP: this username doesn't resolve on X (nonexistent, deactivated, "
+                  f"suspended, or a typo) — session itself is fine.", file=sys.stderr)
+            await dump_debug(page, tag_safe, "missing_user")
+            await context.close()
+            return
 
         if await is_logged_out(page):
             print(f"{tag} ERROR: not authenticated — cookies rejected, expired, rate-limited/challenged, "
