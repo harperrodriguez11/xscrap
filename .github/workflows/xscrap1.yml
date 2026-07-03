@@ -1,71 +1,41 @@
 name: X URL Scraper
-
 on:
-
   workflow_dispatch:
-
     inputs:
-
+      target_usernames:
+        description: "Bulk list of usernames or full URLs to scrape, ONE AT A TIME in order. Separate with commas and/or new lines, '@' optional (e.g. 'user1, user2\\nuser3' or 'https://x.com/search?q=...'). Leave empty to use target_url instead."
+        required: false
+        default: ""
       target_url:
-
-        description: "Page to scrape (home timeline, a profile, a search, etc.)"
-
+        description: "Single-target fallback (used only if target_usernames is empty)."
         required: false
-
         default: "https://x.com/home"
-
       max_urls:
-
-        description: "Max total URLs to collect"
-
+        description: "Max URLs to collect PER TARGET"
         required: false
-
         default: "50"
-
 jobs:
-
   scrape:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
-
     steps:
-
       - name: Checkout repo
-
         uses: actions/checkout@v4
-
       - name: Set up Python
-
         uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.11"
-
       - name: Install dependencies
-
         run: |
-
           pip install -r requirements.txt
-
           playwright install --with-deps chromium
-
       - name: Run scraper
-
         env:
-
-          X_AUTH_TOKEN:      ${{ secrets.X_AUTH_TOKEN }}
-
-          X_CT0:             ${{ secrets.X_CT0 }}
-
-          X_TWID:            ${{ secrets.X_TWID }}
-
-          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
-
-          X_TARGET_URL:      ${{ github.event.inputs.target_url }}
-
-          X_MAX_URLS:        ${{ github.event.inputs.max_urls }}
-
+          X_AUTH_TOKEN:        ${{ secrets.X_AUTH_TOKEN }}
+          X_CT0:               ${{ secrets.X_CT0 }}
+          X_TWID:              ${{ secrets.X_TWID }}
+          GDRIVE_TOKEN_JSON:   ${{ secrets.GDRIVE_TOKEN_JSON }}
+          X_TARGET_USERNAMES:  ${{ github.event.inputs.target_usernames }}
+          X_TARGET_URL:        ${{ github.event.inputs.target_url }}
+          X_MAX_URLS:          ${{ github.event.inputs.max_urls }}
         run: python xscrap1.py
