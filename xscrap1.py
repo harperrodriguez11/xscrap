@@ -16,6 +16,25 @@ scraped one (per your request — not appended).
 Supports scraping several usernames in one run, concurrently (separate
 browser contexts sharing one browser instance, same login cookies), with
 results deduplicated and merged across all of them before writing.
+
+--- FIXES vs previous version ---
+1. Context creation + cookie setup moved INSIDE the try/except for each
+   target, so one bad username can no longer crash the whole batch via
+   asyncio.gather. gather() also now runs with return_exceptions=True as
+   a second safety net so a stray exception can't take down other tasks
+   or skip the sheet write entirely.
+2. page.goto() now uses wait_until="domcontentloaded" instead of
+   "networkidle". X's timeline keeps persistent XHR/websocket traffic
+   alive, so "networkidle" routinely times out (45s) and throws,
+   especially under concurrency -- this was very likely the main reason
+   the multi-username run wasn't producing results while the
+   single-target script (which already used domcontentloaded) worked.
+3. Each target's start is staggered (small delay based on its index)
+   before it navigates, instead of all contexts hitting X at the exact
+   same moment. Firing several concurrent sessions off one auth token
+   simultaneously is a common trigger for X's rate-limit/challenge
+   response, which then looks like "not authenticated" downstream.
+4. goto() now retries once on timeout before giving up on that target.
 """
 
 import asyncio
@@ -32,11 +51,12 @@ from playwright.async_api import async_playwright
 
 TARGET_URL   = os.environ.get("X_TARGET_URL", "https://x.com/home")
 USERNAMES    = os.environ.get("X_USERNAMES", "").strip()
-CONCURRENCY  = int(os.environ.get("X_CONCURRENCY", "3"))
+CONCURRENCY  = int(os.environ.get("X_CONCURRENCY", "2"))        # lowered default
 MAX_URLS     = int(os.environ.get("X_MAX_URLS", "50"))          # per target
 MAX_STUCK    = int(os.environ.get("X_MAX_STUCK_TICKS", "8"))
 HEADLESS     = os.environ.get("X_HEADLESS", "true").lower() != "false"
 DEBUG_DIR    = os.environ.get("X_DEBUG_DIR", "debug_artifacts")
+STAGGER_SEC  = float(os.environ.get("X_STAGGER_SECONDS", "4.0"))  # gap between target starts
 
 AUTH_TOKEN = os.environ.get("X_AUTH_TOKEN")
 CT0        = os.environ.get("X_CT0")
@@ -182,11 +202,9 @@ async def is_logged_out(page) -> bool:
     if "login" in page.url or "flow/login" in page.url:
         return True
     try:
-        # Logged-out home shows a "Sign in to X" / "Sign up" prompt.
         signin = await page.query_selector('a[href="/login"]')
         if signin:
             return True
-        # Primary column / sidebar only exist for authenticated sessions.
         primary_col = await page.query_selector('[data-testid="primaryColumn"]')
         if not primary_col:
             return True
@@ -195,65 +213,79 @@ async def is_logged_out(page) -> bool:
     return False
 
 
-async def scrape_one_target(browser, label, target_url, seen_videos, seen_images, merge_lock):
+async def goto_with_retry(page, url, attempts=2):
+    """domcontentloaded instead of networkidle -- X's timeline never
+    truly goes network-idle (persistent XHR/websocket traffic), so
+    networkidle routinely times out and throws. Retry once on failure."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return
+        except Exception as e:
+            last_err = e
+            print(f"  goto attempt {attempt}/{attempts} failed for {url}: {e!r}", file=sys.stderr)
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+    raise last_err
+
+
+async def scrape_one_target(browser, label, target_url, idx, seen_videos, seen_images, merge_lock):
     local_videos, local_images = set(), set()
     tag = f"[{label or target_url}]"
     tag_safe = re.sub(r"[^a-zA-Z0-9_-]", "_", label or "target")
+    page = None
 
-    context = await browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        ),
-        locale="en-US",
-    )
-
-    # Set cookies on BOTH x.com and twitter.com — many exported session
-    # cookies are still scoped to twitter.com under the hood, and setting
-    # them on only one domain is a common reason auth silently fails.
-    cookie_domains = [".x.com", ".twitter.com"]
-    cookies = []
-    for domain in cookie_domains:
-        cookies.append({
-            "name": "auth_token", "value": AUTH_TOKEN, "domain": domain,
-            "path": "/", "httpOnly": True, "secure": True, "sameSite": "None",
-        })
-        cookies.append({
-            "name": "ct0", "value": CT0, "domain": domain,
-            "path": "/", "httpOnly": False, "secure": True, "sameSite": "None",
-        })
-        if TWID:
-            cookies.append({
-                "name": "twid", "value": TWID, "domain": domain,
-                "path": "/", "secure": True, "sameSite": "None",
-            })
-    await context.add_cookies(cookies)
+    # Stagger starts so we don't fire multiple concurrent sessions off the
+    # same auth token in the same instant -- that pattern is a common
+    # trigger for X's rate-limit/challenge response.
+    await asyncio.sleep(idx * STAGGER_SEC + random.uniform(0, 1.0))
 
     try:
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+
+        cookie_domains = [".x.com", ".twitter.com"]
+        cookies = []
+        for domain in cookie_domains:
+            cookies.append({
+                "name": "auth_token", "value": AUTH_TOKEN, "domain": domain,
+                "path": "/", "httpOnly": True, "secure": True, "sameSite": "None",
+            })
+            cookies.append({
+                "name": "ct0", "value": CT0, "domain": domain,
+                "path": "/", "httpOnly": False, "secure": True, "sameSite": "None",
+            })
+            if TWID:
+                cookies.append({
+                    "name": "twid", "value": TWID, "domain": domain,
+                    "path": "/", "secure": True, "sameSite": "None",
+                })
+        await context.add_cookies(cookies)
+
         page = await context.new_page()
-        # Also set the x-csrf-token header to match ct0 — some XHR calls
-        # the timeline depends on will 403 without it lining up.
         await page.set_extra_http_headers({"x-csrf-token": CT0})
 
-        await page.goto(target_url, wait_until="networkidle", timeout=45000)
+        await goto_with_retry(page, target_url)
 
         if await is_logged_out(page):
-            print(f"{tag} ERROR: not authenticated — cookies rejected, expired, or scoped to the wrong domain.", file=sys.stderr)
+            print(f"{tag} ERROR: not authenticated — cookies rejected, expired, rate-limited/challenged, "
+                  f"or scoped to the wrong domain.", file=sys.stderr)
             await dump_debug(page, tag_safe, "logged_out")
+            await context.close()
             return
 
-        # Wait explicitly for at least one tweet to render instead of a
-        # flat sleep — SPA hydration + the timeline XHR can take longer
-        # than a fixed delay, especially on a cold CI runner.
         try:
             await page.wait_for_selector('article[data-testid="tweet"]', timeout=20000)
         except Exception:
             print(f"{tag} WARNING: no tweet articles appeared within 20s — page may be rate-limited, "
                   f"showing a challenge, or the account has no visible posts.", file=sys.stderr)
             await dump_debug(page, tag_safe, "no_tweets_found")
-            # Don't return immediately — fall through and let the scan loop
-            # try anyway in case tweets arrive a beat later.
 
         await asyncio.sleep(random.uniform(1.0, 2.0))
 
@@ -282,8 +314,6 @@ async def scrape_one_target(browser, label, target_url, seen_videos, seen_images
             )
 
             if tick == 1 and total_found == 0:
-                # First scan found literally nothing — capture evidence now,
-                # before we scroll away from whatever state caused it.
                 await dump_debug(page, tag_safe, "first_scan_empty")
 
             if total_found >= MAX_URLS:
@@ -299,14 +329,21 @@ async def scrape_one_target(browser, label, target_url, seen_videos, seen_images
             await page.mouse.wheel(0, step)
             await asyncio.sleep(human_delay())
 
+        await context.close()
+
     except Exception as e:
+        # This now covers context creation / cookie setup too, so one bad
+        # target can no longer take the whole run down with it.
         print(f"{tag} ERROR during scrape: {e!r}", file=sys.stderr)
+        if page is not None:
+            try:
+                await dump_debug(page, tag_safe, "exception")
+            except Exception:
+                pass
         try:
-            await dump_debug(page, tag_safe, "exception")
+            await context.close()
         except Exception:
             pass
-    finally:
-        await context.close()
 
     async with merge_lock:
         new_v = local_videos - seen_videos
@@ -328,11 +365,18 @@ async def scrape_all(targets):
             args=["--disable-blink-features=AutomationControlled"],
         )
 
-        async def bound(label, url):
+        async def bound(label, url, idx):
             async with sem:
-                await scrape_one_target(browser, label, url, seen_videos, seen_images, merge_lock)
+                await scrape_one_target(browser, label, url, idx, seen_videos, seen_images, merge_lock)
 
-        await asyncio.gather(*[bound(label, url) for label, url in targets])
+        results = await asyncio.gather(
+            *[bound(label, url, idx) for idx, (label, url) in enumerate(targets)],
+            return_exceptions=True,  # safety net: one crashed task can't kill the batch or skip the sheet write
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"[!] A target task raised unexpectedly: {r!r}", file=sys.stderr)
+
         await browser.close()
 
     return seen_videos, seen_images
@@ -392,7 +436,8 @@ def replace_url_list(sheets_service, spreadsheet_id, tab_name, urls):
 def main():
     targets = build_targets()
     label_desc = ", ".join(l or u for l, u in targets)
-    print(f"🚀 Scraping {len(targets)} target(s) with concurrency={CONCURRENCY}: {label_desc}\n")
+    print(f"🚀 Scraping {len(targets)} target(s) with concurrency={CONCURRENCY}, "
+          f"stagger={STAGGER_SEC}s: {label_desc}\n")
 
     seen_videos, seen_images = asyncio.run(scrape_all(targets))
 
