@@ -68,4 +68,4 @@ jobs:
 
           X_MAX_URLS:        ${{ github.event.inputs.max_urls }}
 
-        run: python scrap1.py
+        run: python xscrap1.py
